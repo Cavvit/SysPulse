@@ -1,0 +1,8 @@
+﻿*.bak
+*.exe
+*.obj
+*.pdb
+bin/
+obj/
+.vs/
+Thumbs.db
