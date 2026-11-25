@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
@@ -49,6 +50,16 @@ namespace SysPulse
 
         [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, IntPtr ProcessInformation, uint ProcessInformationSize);
@@ -274,13 +285,16 @@ namespace SysPulse
             { "EXCEL", "Microsoft Excel" },
             { "POWERPNT", "Microsoft PowerPoint" },
             { "Figma", "Figma" },
-            { "Obsidian", "Obsidian" }
+            { "Obsidian", "Obsidian" },
+            { "Cursor", "Cursor IDE" },
+            { "Antigravity", "Antigravity" }
         };
 
         // Games (Boosted in Performance Mode, Protected from Kill)
         private readonly Dictionary<string, string> KnownGames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             { "cs2", "Counter-Strike 2" },
+            { "FarmingSimulator2022Game", "Farming Simulator 22" },
             { "VALORANT-Win64-Shipping", "VALORANT" },
             { "dota2", "Dota 2" },
             { "r5apex", "Apex Legends" },
@@ -324,6 +338,25 @@ namespace SysPulse
         {
             "SpotifyLauncher", "hamachi-2", "LMIGuardianSvc", "EpicGamesLauncher",
             "EpicWebHelper", "EA", "EADesktop", "EABackgroundService", "UbisoftConnect", "upc", "Battle.net"
+        };
+
+        // Smart Guard: strictly safe re-spawned bloat to suppress during heavy work / games (never touches SearchHost/OneDrive/WebView2)
+        private readonly HashSet<string> GuardSafeBloat = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Widgets", "WidgetService", "WidgetBoard", "PhoneExperienceHost",
+            "MicrosoftStartFeedProvider", "CrossDeviceResume", "Copilot"
+        };
+
+        private readonly HashSet<string> GuardSafeOverlays = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "GameBar", "GameBarPresenceWriter", "XboxGameBarWidgets", "XboxGameBarSpotify"
+        };
+
+        // Smart Guard: background apps put into Windows EcoQoS (NEVER killed, auto-restored when focused or idle)
+        private readonly HashSet<string> GuardThrottleApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Spotify", "WhatsApp", "Discord", "Telegram", "Slack", "Teams", "ms-teams",
+            "chrome", "msedge", "firefox", "brave", "opera", "vivaldi"
         };
 
         // Detected Hardware Info
@@ -374,6 +407,8 @@ namespace SysPulse
         private CheckBox chkStandbyPurge;
         private CheckBox chkAutoFocusBoost;
         private CheckBox chkAutoBatteryEco;
+        private CheckBox chkAutoRamClean;
+        private CheckBox chkSmartGuard;
 
         private Button btnPerformanceFocus;
         private Button btnBatteryEcoFocus;
@@ -382,8 +417,22 @@ namespace SysPulse
         private RichTextBox txtLog;
         private System.Windows.Forms.Timer uiTimer;
         private NotifyIcon trayIcon;
+        private ToolTip uiToolTip;
+        private EventWaitHandle showWindowEvent;
+        private ManualResetEventSlim stopWakeListener;
 
         private bool isBusy = false;
+        private bool allowExit = false;
+        private bool trayHintShown = false;
+        private DateTime lastAutoRamCleanUtc = DateTime.MinValue;
+        private const uint AutoRamThresholdPct = 80;
+        private const int AutoRamCooldownMinutes = 20;
+        private DateTime lastSmartGuardUtc = DateTime.MinValue;
+        private bool smartGuardRunning = false;
+        private bool smartGuardWasActive = false;
+        private const int SmartGuardIntervalSeconds = 45;
+        private const uint SmartGuardRamTriggerPct = 75;
+        private const uint SmartGuardRamReleasePct = 70;
         private HashSet<int> boostedPids = new HashSet<int>();
 
         public MainForm()
@@ -407,6 +456,63 @@ namespace SysPulse
             uiTimer = new System.Windows.Forms.Timer { Interval = 2500 };
             uiTimer.Tick += (s, e) => OnTimerTick();
             uiTimer.Start();
+
+            StartWakeListener();
+        }
+
+        private void BringToFrontFromTray()
+        {
+            if (this.IsDisposed) return;
+            if (!this.Visible) this.Show();
+            if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal;
+            this.TopMost = true;
+            this.Activate();
+            this.TopMost = false;
+            try { NativeMethods.SetForegroundWindow(this.Handle); } catch { }
+        }
+
+        private void StartWakeListener()
+        {
+            try
+            {
+                bool created;
+                EventWaitHandleSecurity sec = new EventWaitHandleSecurity();
+                SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
+                if (currentUser != null)
+                {
+                    sec.AddAccessRule(new EventWaitHandleAccessRule(
+                        currentUser,
+                        EventWaitHandleRights.Modify | EventWaitHandleRights.Synchronize,
+                        AccessControlType.Allow));
+                }
+                showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowWindowEventName, out created, sec);
+                stopWakeListener = new ManualResetEventSlim(false);
+                Thread t = new Thread(() =>
+                {
+                    WaitHandle[] handles = new WaitHandle[] { showWindowEvent, stopWakeListener.WaitHandle };
+                    while (true)
+                    {
+                        int idx;
+                        try { idx = WaitHandle.WaitAny(handles); }
+                        catch { break; }
+                        if (idx == 0)
+                        {
+                            try
+                            {
+                                if (!this.IsDisposed && this.IsHandleCreated)
+                                    this.BeginInvoke((Action)BringToFrontFromTray);
+                            }
+                            catch { }
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                }) { IsBackground = true, Name = "SysPulse_WakeListener" };
+                t.Start();
+            }
+            catch { }
         }
 
         private async Task LoadHardwareProfileAsync()
@@ -691,61 +797,126 @@ namespace SysPulse
             };
             pnlHwStrip.Controls.Add(lblProtectedTools);
 
-            // 2. Options Panel
-            Panel pnlOptions = new Panel
+            // 2. Options Section: Split into 2 Clear Side-by-Side Cards
+            uiToolTip = new ToolTip
+            {
+                InitialDelay = 250,
+                ReshowDelay = 100,
+                AutoPopDelay = 8000
+            };
+
+            // Left Card: Cleanup & Mode Scope
+            Panel pnlCleanupScope = new Panel
             {
                 Location = new Point(20, 168),
-                Size = new Size(744, 198),
+                Size = new Size(366, 222),
                 BackColor = Color.FromArgb(24, 28, 38)
             };
-            this.Controls.Add(pnlOptions);
+            this.Controls.Add(pnlCleanupScope);
 
-            Label lblOptHeader = new Label
+            Label lblScopeHeader = new Label
             {
-                Text = "AKILLI OPTİMİZASYON & KAYNAK KORUMA SEÇENEKLERİ",
+                Text = "🧹 TEMİZLİK & MOD KAPSAMI",
                 Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(145, 165, 195),
-                Location = new Point(18, 10),
+                ForeColor = Color.FromArgb(0, 212, 255),
+                Location = new Point(14, 9),
                 AutoSize = true
             };
-            pnlOptions.Controls.Add(lblOptHeader);
+            pnlCleanupScope.Controls.Add(lblScopeHeader);
 
-            chkWinBloat = CreateCheck(pnlOptions, 18, 35, true,
-                "Windows Gereksiz Arka Plan (Telefon Bağlantısı, Widgets, Hava Durumu, Copilot/Arama Önbelleği)");
-            chkLaunchers = CreateCheck(pnlOptions, 18, 61, true,
-                "Arka Plan Mağaza & Başlatıcıları Hafiflet (Steam WebHelper, Epic, EA, SpotifyLauncher, Hamachi)");
-            chkGameOverlays = CreateCheck(pnlOptions, 18, 87, true,
-                "Gereksiz Xbox Game Bar & Arka Plan Kayıt Katmanlarını Kapat (~300 MB RAM & Pil tasarrufu)");
-            chkHeavyServices = CreateCheck(pnlOptions, 18, 113, true,
-                "Boştaki Ağır Servisleri Duraklat (Kullanılmayan WSL / Hyper-V / Hamachi - yazıcı servisine dokunulmaz)");
-            chkBrowserEco = CreateCheck(pnlOptions, 18, 139, true,
-                "Pil/Web Modunda Tarayıcıları (Chrome/Edge/Firefox/Brave) Windows Verimlilik Moduna (EcoQoS) Al");
-            chkStandbyPurge = CreateCheck(pnlOptions, 18, 165, true,
-                "Derin RAM Sıkıştırma & Windows Standby (Bekleme) Önbelleği Temizliği");
+            Button btnSelectAllScope = CreateMiniLinkButton("Tümü", new Point(252, 7), new Size(48, 20));
+            btnSelectAllScope.Click += (s, e) =>
+            {
+                chkWinBloat.Checked = chkLaunchers.Checked = chkGameOverlays.Checked = chkHeavyServices.Checked = chkStandbyPurge.Checked = true;
+            };
+            pnlCleanupScope.Controls.Add(btnSelectAllScope);
 
-            // Right-side Smart Automation Toggles
-            chkAutoFocusBoost = CreateCheck(pnlOptions, 465, 139, true,
-                "Otomatik İş / Oyun CPU Hızlandırma");
-            chkAutoBatteryEco = CreateCheck(pnlOptions, 465, 165, true,
-                "Pildeyken Otomatik Güç Tasarrufu");
+            Button btnSelectSafeScope = CreateMiniLinkButton("Sadece RAM", new Point(304, 7), new Size(52, 20));
+            btnSelectSafeScope.Click += (s, e) =>
+            {
+                chkWinBloat.Checked = chkLaunchers.Checked = chkGameOverlays.Checked = chkHeavyServices.Checked = false;
+                chkStandbyPurge.Checked = true;
+            };
+            pnlCleanupScope.Controls.Add(btnSelectSafeScope);
+
+            chkWinBloat = CreateOptionItem(pnlCleanupScope, 35, true,
+                "Windows Gereksiz Arka Planı",
+                "Widgets, Hava Durumu, Copilot, Telefon Bağlantısı",
+                "Performans veya Pil modunda kullanılmayan Windows arka plan bileşenlerini kapatır.");
+            chkLaunchers = CreateOptionItem(pnlCleanupScope, 72, true,
+                "Boştaki Oyun & Mağaza Başlatıcıları",
+                "Steam WebHelper, Epic, EA, SpotifyLauncher, Hamachi",
+                "Oyun açık değilken arka planda RAM tüketen mağaza/başlatıcı yardımcılarını hafifletir.");
+            chkGameOverlays = CreateOptionItem(pnlCleanupScope, 109, true,
+                "Oyun Kayıt & Katmanları (~300 MB)",
+                "Xbox Game Bar ve arka plan ekran kayıt katmanları",
+                "Gereksiz oyun katmanlarını kapatarak RAM ve CPU tasarrufu sağlar.");
+            chkHeavyServices = CreateOptionItem(pnlCleanupScope, 146, true,
+                "Boştaki Ağır Servisleri Duraklat",
+                "Kullanılmayan WSL, Hyper-V, Hamachi (yazıcı korunur)",
+                "Sanal makine ve tünel servislerini geçici duraklatır; çıkışta veya Normal Modda geri açar.");
+            chkStandbyPurge = CreateOptionItem(pnlCleanupScope, 183, true,
+                "Derin RAM & Standby Önbelleği",
+                "Windows bekleme (Standby) bellek önbelleğini sıfırla",
+                "Uygulamaları kapatmadan çalışma kümelerini ve Windows Standby önbelleğini temizler.");
+
+            // Right Card: Automatic Background & Power Features
+            Panel pnlAutoRules = new Panel
+            {
+                Location = new Point(398, 168),
+                Size = new Size(366, 222),
+                BackColor = Color.FromArgb(24, 28, 38)
+            };
+            this.Controls.Add(pnlAutoRules);
+
+            Label lblAutoHeader = new Label
+            {
+                Text = "🤖 OTOMATİK ARKA PLAN & TASARRUF",
+                Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(110, 235, 150),
+                Location = new Point(14, 9),
+                AutoSize = true
+            };
+            pnlAutoRules.Controls.Add(lblAutoHeader);
+
+            chkSmartGuard = CreateOptionItem(pnlAutoRules, 35, true,
+                "Akıllı Bekçi (Oyun & Ağır İş)",
+                "Bloat'ı engeller, arka plan uygulamalarını EcoQoS'a alır",
+                "Oyun, ağır iş uygulaması (IDE/render) veya %75+ RAM yükünde yeniden açılan Windows bloat'larını durdurur; odakta olmayan Spotify/WhatsApp/tarayıcıları kapatmadan EcoQoS verimlilik moduna alır.");
+            chkAutoRamClean = CreateOptionItem(pnlAutoRules, 72, true,
+                "Otomatik RAM Temizle (%80+ Eşik)",
+                "RAM %80'i geçince 20 dk arayla temizler (oyunda atlar)",
+                "Hiçbir uygulamayı kapatmadan, yalnızca RAM %80 üstüne çıktığında otomatik bellek temizler.");
+            chkAutoFocusBoost = CreateOptionItem(pnlAutoRules, 109, true,
+                "Otomatik Oyun & İş Hızlandırma",
+                "Oyun veya ağır IDE açıldığında CPU önceliği verir",
+                "Aktif oyun veya geliştirme aracını algılayıp işlemci önceliğini otomatik yükseltir.");
+            chkAutoBatteryEco = CreateOptionItem(pnlAutoRules, 146, true,
+                "Pilde Otomatik Güç Tasarrufu",
+                "Adaptör çekildiğinde pil tasarruf moduna geçer",
+                "Bilgisayar fişten çekildiğinde otomatik olarak Pil & Web Tasarruf Modunu devreye alır.");
+            chkBrowserEco = CreateOptionItem(pnlAutoRules, 183, true,
+                "Tarayıcı Verimlilik Modu (EcoQoS)",
+                "Pil modunda Chrome, Edge ve Brave'i tasarrufa alır",
+                "Pil/Web modunda tarayıcı arka plan sekmelerine Windows EcoQoS verimlilik modu uygular.");
 
             // 3. Action Buttons (4 Modes)
-            btnPerformanceFocus = CreateButton("⚡ PERFORMANS ODAĞI BAŞLAT", new Point(20, 378), new Size(235, 52),
+            btnPerformanceFocus = CreateButton("⚡ PERFORMANS ODAĞI BAŞLAT", new Point(20, 402), new Size(235, 52),
                 Color.FromArgb(0, 150, 105), Color.White);
             btnPerformanceFocus.Click += async (s, e) => await RunPerformanceFocusAsync();
             this.Controls.Add(btnPerformanceFocus);
 
-            btnBatteryEcoFocus = CreateButton("🔋 PİL & WEB TASARRUF MODU", new Point(265, 378), new Size(225, 52),
+            btnBatteryEcoFocus = CreateButton("🔋 PİL & WEB TASARRUF MODU", new Point(265, 402), new Size(225, 52),
                 Color.FromArgb(205, 125, 20), Color.White);
             btnBatteryEcoFocus.Click += async (s, e) => await RunBatteryEcoModeAsync(autoTriggered: false);
             this.Controls.Add(btnBatteryEcoFocus);
 
-            btnCleanRam = CreateButton("🧹 BELLEK TEMİZLE", new Point(500, 378), new Size(145, 52),
+            btnCleanRam = CreateButton("🧹 BELLEK TEMİZLE", new Point(500, 402), new Size(145, 52),
                 Color.FromArgb(0, 115, 195), Color.White);
             btnCleanRam.Click += async (s, e) => await RunCleanMemoryOnlyAsync();
             this.Controls.Add(btnCleanRam);
 
-            btnRestoreNormal = CreateButton("🔄 NORMAL MOD", new Point(655, 378), new Size(109, 52),
+            btnRestoreNormal = CreateButton("🔄 NORMAL MOD", new Point(655, 402), new Size(109, 52),
                 Color.FromArgb(55, 62, 78), Color.FromArgb(225, 230, 240));
             btnRestoreNormal.Click += async (s, e) => await RestoreNormalModeAsync();
             this.Controls.Add(btnRestoreNormal);
@@ -753,8 +924,8 @@ namespace SysPulse
             // 4. Activity Log Box
             txtLog = new RichTextBox
             {
-                Location = new Point(20, 442),
-                Size = new Size(744, 182),
+                Location = new Point(20, 466),
+                Size = new Size(744, 158),
                 BackColor = Color.FromArgb(11, 13, 18),
                 ForeColor = Color.FromArgb(200, 215, 230),
                 Font = new Font("Consolas", 9.1f, FontStyle.Regular),
@@ -771,31 +942,66 @@ namespace SysPulse
                 Visible = true
             };
             ContextMenuStrip trayMenu = new ContextMenuStrip();
-            trayMenu.Items.Add("Pencereyi Aç", null, (s, e) => { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); });
+            trayMenu.Items.Add("Pencereyi Aç", null, (s, e) => BringToFrontFromTray());
             trayMenu.Items.Add("⚡ Performans Odağı Başlat", null, async (s, e) => await RunPerformanceFocusAsync());
             trayMenu.Items.Add("🔋 Pil & Web Tasarruf Modu", null, async (s, e) => await RunBatteryEcoModeAsync(false));
             trayMenu.Items.Add("🧹 Bellek Temizle", null, async (s, e) => await RunCleanMemoryOnlyAsync());
             trayMenu.Items.Add("🔄 Normal Mod", null, async (s, e) => await RestoreNormalModeAsync());
             trayMenu.Items.Add("-");
-            trayMenu.Items.Add("Çıkış", null, (s, e) => { trayIcon.Visible = false; Application.Exit(); });
+            trayMenu.Items.Add("Çıkış (Tamamen Kapat)", null, (s, e) => { allowExit = true; trayIcon.Visible = false; Application.Exit(); });
             trayIcon.ContextMenuStrip = trayMenu;
-            trayIcon.DoubleClick += (s, e) => { this.Show(); this.WindowState = FormWindowState.Normal; this.Activate(); };
+            trayIcon.DoubleClick += (s, e) => BringToFrontFromTray();
         }
 
-        private CheckBox CreateCheck(Control parent, int x, int y, bool isChecked, string text)
+        private CheckBox CreateOptionItem(Control parent, int y, bool isChecked, string title, string subtitle, string tooltip)
         {
             CheckBox chk = new CheckBox
             {
-                Location = new Point(x, y),
-                Text = text,
+                Location = new Point(14, y),
+                Text = title,
                 Checked = isChecked,
                 AutoSize = true,
-                ForeColor = Color.FromArgb(220, 225, 235),
-                Font = new Font("Segoe UI", 9f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(235, 240, 248),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
             parent.Controls.Add(chk);
+
+            Label lblSub = new Label
+            {
+                Location = new Point(31, y + 18),
+                Text = subtitle,
+                AutoSize = true,
+                ForeColor = Color.FromArgb(140, 155, 180),
+                Font = new Font("Segoe UI", 7.8f, FontStyle.Regular),
+                Cursor = Cursors.Hand
+            };
+            lblSub.Click += (s, e) => { chk.Checked = !chk.Checked; };
+            parent.Controls.Add(lblSub);
+
+            if (uiToolTip != null && !string.IsNullOrEmpty(tooltip))
+            {
+                uiToolTip.SetToolTip(chk, tooltip);
+                uiToolTip.SetToolTip(lblSub, tooltip);
+            }
             return chk;
+        }
+
+        private Button CreateMiniLinkButton(string text, Point loc, Size size)
+        {
+            Button btn = new Button
+            {
+                Text = text,
+                Location = loc,
+                Size = size,
+                BackColor = Color.FromArgb(36, 43, 58),
+                ForeColor = Color.FromArgb(180, 205, 235),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 7.5f, FontStyle.Regular),
+                Cursor = Cursors.Hand
+            };
+            btn.FlatAppearance.BorderSize = 0;
+            return btn;
         }
 
         private Button CreateButton(string text, Point loc, Size size, Color backColor, Color foreColor)
@@ -854,6 +1060,177 @@ namespace SysPulse
             {
                 UpdateActiveFocusLabelOnly();
             }
+
+            // Smart Guard: instant foreground unthrottle if user switches to a throttled app
+            if (smartGuardWasActive)
+            {
+                UnthrottleForegroundApp();
+            }
+
+            // Smart Guard: periodic safe bloat suppression + background EcoQoS during games or heavy work
+            if (chkSmartGuard != null && chkSmartGuard.Checked && !smartGuardRunning &&
+                (DateTime.UtcNow - lastSmartGuardUtc).TotalSeconds >= SmartGuardIntervalSeconds)
+            {
+                lastSmartGuardUtc = DateTime.UtcNow;
+                await RunSmartGuardPassAsync();
+            }
+
+            // Threshold-based automatic RAM cleanup (safe: never kills apps, skips during games)
+            if (chkAutoRamClean != null && chkAutoRamClean.Checked &&
+                (DateTime.UtcNow - lastAutoRamCleanUtc).TotalMinutes >= AutoRamCooldownMinutes)
+            {
+                var mem = GetMemoryInfo();
+                if (mem.loadPct >= AutoRamThresholdPct && !DetectRunningGame())
+                {
+                    lastAutoRamCleanUtc = DateTime.UtcNow;
+                    await RunCleanMemoryOnlyAsync(autoTriggered: true);
+                }
+            }
+        }
+
+        private string GetForegroundProcessName()
+        {
+            try
+            {
+                IntPtr hwnd = NativeMethods.GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return null;
+                uint pid = 0;
+                NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+                if (pid == 0) return null;
+                using (Process p = Process.GetProcessById((int)pid))
+                {
+                    return p.ProcessName;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void UnthrottleForegroundApp()
+        {
+            string fgName = GetForegroundProcessName();
+            if (string.IsNullOrEmpty(fgName)) return;
+
+            List<int> trackedPids;
+            lock (stateLock)
+            {
+                if (throttledByUs.Count == 0) return;
+                trackedPids = throttledByUs.Keys.ToList();
+            }
+
+            foreach (int pid in trackedPids)
+            {
+                try
+                {
+                    using (Process p = Process.GetProcessById(pid))
+                    {
+                        if (string.Equals(p.ProcessName, fgName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ProcessPriorityClass orig;
+                            lock (stateLock)
+                            {
+                                if (!throttledByUs.TryGetValue(pid, out orig)) continue;
+                                throttledByUs.Remove(pid);
+                            }
+                            NativeMethods.SetProcessEcoQoS(p.Handle, enableEco: false);
+                            if (p.PriorityClass == ProcessPriorityClass.BelowNormal)
+                                p.PriorityClass = orig;
+                        }
+                    }
+                }
+                catch
+                {
+                    lock (stateLock) { throttledByUs.Remove(pid); }
+                }
+            }
+        }
+
+        private async Task RunSmartGuardPassAsync()
+        {
+            if (smartGuardRunning || isBusy) return;
+            smartGuardRunning = true;
+
+            bool allowBloatSuppress = chkWinBloat != null && chkWinBloat.Checked;
+            bool allowOverlaySuppress = chkGameOverlays != null && chkGameOverlays.Checked;
+            bool inPerfMode = currentModeName != null && currentModeName.StartsWith("Performans", StringComparison.OrdinalIgnoreCase);
+            bool inBatteryEco = currentModeName != null && currentModeName.StartsWith("Pil", StringComparison.OrdinalIgnoreCase);
+
+            await Task.Run(() =>
+            {
+                try
+                {
+                    var mem = GetMemoryInfo();
+                    string focusLabel = DetectRunningFocusLabel();
+                    bool gameRunning = DetectRunningGame();
+                    bool heavyActive = focusLabel != null || inPerfMode || mem.loadPct >= SmartGuardRamTriggerPct;
+
+                    if (!heavyActive)
+                    {
+                        if (smartGuardWasActive && !inBatteryEco && mem.loadPct < SmartGuardRamReleasePct)
+                        {
+                            smartGuardWasActive = false;
+                            RestoreThrottledProcesses();
+                            LogSafe("[🛡️] Akıllı Bekçi: Ağır iş/oyun bitti, arka plan uygulamaları normale döndürüldü.", Color.FromArgb(130, 215, 250));
+                        }
+                        return;
+                    }
+
+                    bool justActivated = !smartGuardWasActive;
+                    smartGuardWasActive = true;
+
+                    string fgName = GetForegroundProcessName();
+                    int suppressedCount = 0;
+                    int throttledCount = 0;
+
+                    Process[] allProcs = Process.GetProcesses();
+                    foreach (Process p in allProcs)
+                    {
+                        try
+                        {
+                            string name = p.ProcessName;
+
+                            // 1. Suppress strictly safe re-spawned Windows bloat / overlays
+                            bool isBloat = allowBloatSuppress && GuardSafeBloat.Contains(name);
+                            bool isOverlay = allowOverlaySuppress && gameRunning && GuardSafeOverlays.Contains(name);
+                            if (isBloat || isOverlay)
+                            {
+                                if (IsSafeToKill(p))
+                                {
+                                    p.Kill();
+                                    suppressedCount++;
+                                }
+                                continue;
+                            }
+
+                            // 2. Apply EcoQoS (zero-kill) to background apps NOT currently in foreground
+                            if (GuardThrottleApps.Contains(name))
+                            {
+                                if (!string.IsNullOrEmpty(fgName) && string.Equals(name, fgName, StringComparison.OrdinalIgnoreCase))
+                                    continue;
+
+                                bool alreadyThrottled;
+                                lock (stateLock) { alreadyThrottled = throttledByUs.ContainsKey(p.Id); }
+                                if (!alreadyThrottled && ThrottleProcess(p))
+                                    throttledCount++;
+                            }
+                        }
+                        catch { }
+                        finally { p.Dispose(); }
+                    }
+
+                    if (justActivated || suppressedCount > 0 || throttledCount > 0)
+                    {
+                        string reason = focusLabel ?? (inPerfMode ? "Performans Modu" : string.Format("Yüksek RAM (%{0})", mem.loadPct));
+                        LogSafe(string.Format("[🛡️] Akıllı Bekçi ({0}): {1} gereksiz arka plan durduruldu, {2} arka plan işlemi EcoQoS'a alındı.",
+                            reason, suppressedCount, throttledCount), Color.FromArgb(120, 225, 255));
+                    }
+                }
+                catch { }
+            });
+
+            smartGuardRunning = false;
         }
 
         private struct MemoryInfo
@@ -1172,15 +1549,19 @@ namespace SysPulse
         }
 
         // MODE 3: SADECE BELLEK TEMİZLEME
-        private async Task RunCleanMemoryOnlyAsync()
+        private async Task RunCleanMemoryOnlyAsync(bool autoTriggered = false)
         {
             if (isBusy) return;
             isBusy = true;
+            lastAutoRamCleanUtc = DateTime.UtcNow;
             SetButtonsEnabled(false);
 
             var beforeMem = GetMemoryInfo();
             Log("----------------------------------------------------------------------", Color.FromArgb(90, 100, 120));
-            Log("🧹 HIZLI BELLEK (RAM) TEMİZLEME BAŞLATILIYOR...", Color.FromArgb(0, 212, 255));
+            if (autoTriggered)
+                Log(string.Format("🤖 OTOMATİK RAM TEMİZLİĞİ (RAM %{0} >= %{1} eşiği)...", beforeMem.loadPct, AutoRamThresholdPct), Color.FromArgb(0, 212, 255));
+            else
+                Log("🧹 HIZLI BELLEK (RAM) TEMİZLEME BAŞLATILIYOR...", Color.FromArgb(0, 212, 255));
 
             int trimmedProcs = 0;
             bool standbyOk = false;
@@ -1217,6 +1598,7 @@ namespace SysPulse
             SetButtonsEnabled(false);
 
             currentModeName = "Standart / Dengeli";
+            smartGuardWasActive = false;
             Log("----------------------------------------------------------------------", Color.FromArgb(90, 100, 120));
             Log("🔄 Normal / Dengeli Moda dönülüyor...", Color.FromArgb(0, 212, 255));
 
@@ -1603,7 +1985,26 @@ namespace SysPulse
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // SAFETY: never leave the system in a modified state after exit
+            // When user clicks 'X', hide to system tray so background monitoring & auto-RAM clean continue
+            if (!allowExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                this.Hide();
+                if (trayIcon != null && !trayHintShown)
+                {
+                    trayHintShown = true;
+                    try
+                    {
+                        trayIcon.ShowBalloonTip(2500, "SysPulse Arka Planda Çalışıyor",
+                            "Otomatik RAM temizleme ve izleme aktif. Tamamen kapatmak için sağ alttaki simgeye sağ tıklayıp 'Çıkış' seçin.",
+                            ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
+                return;
+            }
+
+            // SAFETY: never leave the system in a modified state after real exit
             try
             {
                 bool dirty;
@@ -1618,6 +2019,17 @@ namespace SysPulse
             }
             catch { }
 
+            if (stopWakeListener != null)
+            {
+                try { stopWakeListener.Set(); stopWakeListener.Dispose(); } catch { }
+                stopWakeListener = null;
+            }
+            if (showWindowEvent != null)
+            {
+                try { showWindowEvent.Dispose(); } catch { }
+                showWindowEvent = null;
+            }
+
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
@@ -1629,6 +2041,20 @@ namespace SysPulse
 
     static class Program
     {
+        public const string ShowWindowEventName = @"Local\SysPulse_ShowWindow";
+
+        private static void SignalExistingInstance()
+        {
+            try
+            {
+                using (EventWaitHandle showEvt = EventWaitHandle.OpenExisting(ShowWindowEventName, EventWaitHandleRights.Modify))
+                {
+                    showEvt.Set();
+                }
+            }
+            catch { }
+        }
+
         // SECURITY: per-user log location (no hardcoded profile path, no writes next to the exe)
         private static readonly string LogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SysPulse", "error.log");
@@ -1652,10 +2078,25 @@ namespace SysPulse
             try { NativeMethods.SetDefaultDllDirectories(NativeMethods.LOAD_LIBRARY_SEARCH_SYSTEM32); } catch { }
 
             // Single instance: two copies would fight over power plans / restore state
-            bool createdNew;
-            using (Mutex mtx = new Mutex(true, @"Local\SysPulse_SingleInstance", out createdNew))
+            bool createdNew = false;
+            Mutex mtx = null;
+            try
             {
-                if (!createdNew) return;
+                mtx = new Mutex(true, @"Local\SysPulse_SingleInstance", out createdNew);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                SignalExistingInstance();
+                return;
+            }
+
+            using (mtx)
+            {
+                if (!createdNew)
+                {
+                    SignalExistingInstance();
+                    return;
+                }
 
                 Application.ThreadException += (s, e) => WriteLog(e.Exception.ToString());
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => WriteLog(e.ExceptionObject.ToString());
